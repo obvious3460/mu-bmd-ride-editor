@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>MU 骑乘突刺高度编辑器</title>
+<style>
+body { font: 16px/1.6 system-ui, sans-serif; margin: 36px auto; max-width: 720px; padding: 0 20px; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid #ddd; }
+input[type=number] { width: 110px; }
+button { margin: 4px; padding: 4px 12px; }
+</style>
+<h1>MU 骑乘突刺高度编辑器</h1>
+<p>打开角色 player.bmd，查看和修改动作 82 的根骨骼 Z 坐标。文件在浏览器本地读取。</p>
+<input type="file" id="file" accept=".bmd">
+<p id="status" role="status"></p>
+<section id="editor" hidden>
+  <label>批量增减 Z <input id="offset" type="number" step="any" value="0"></label>
+  <button id="apply">应用到当前各帧</button>
+  <button id="save">导出 BMD 副本</button>
+  <table><thead><tr><th>帧</th><th>原始 Z</th><th>修改后 Z</th></tr></thead><tbody id="frames"></tbody></table>
+</section>
+<script>
+"use strict";
+const cipher = [0xd1, 0x73, 0x52, 0xf6, 0xd2, 0x9a, 0xcb, 0x27,
+    0x3e, 0xaf, 0x59, 0x31, 0x37, 0xb3, 0xe7, 0xa2];
+
+function crypt(bytes, encode) {
+    const result = new Uint8Array(bytes.length);
+    let key = 0x5e;
+    for (let i = 0; i < bytes.length; ++i) {
+        if (encode) {
+            result[i] = (bytes[i] + key) ^ cipher[i % 16];
+            key = (result[i] + 0x3d) & 255;
+        } else {
+            result[i] = (bytes[i] ^ cipher[i % 16]) - key;
+            key = (bytes[i] + 0x3d) & 255;
+        }
+    }
+    return result;
+}
+
+function readPlayer(buffer) {
+    const header = new DataView(buffer);
+    if (header.byteLength < 8 || header.getUint8(0) !== 66 || header.getUint8(1) !== 77 ||
+        header.getUint8(2) !== 68 || header.getUint8(3) !== 12 ||
+        header.getUint32(4, true) !== header.byteLength - 8) {
+        throw new Error("请选择客户端使用的 v12 player.bmd。");
+    }
+    const payload = crypt(new Uint8Array(buffer, 8), false);
+    const data = new DataView(payload.buffer);
+    const bones = data.getInt16(34, true);
+    const actions = data.getInt16(36, true);
+    if (data.getInt16(32, true) !== 0 || bones < 1 || actions <= 82) {
+        throw new Error("需要包含动作 82 的无网格角色 BMD。");
+    }
+    const keys = [];
+    let pos = 38;
+    for (let action = 0; action < actions; ++action) {
+        const count = data.getInt16(pos, true);
+        const lock = data.getUint8(pos + 2);
+        if (count < 0 || lock > 1) throw new Error("动作表无效。");
+        keys.push(count);
+        pos += 3 + lock * count * 12;
+    }
+    const boneBytes = keys.reduce((sum, count) => sum + count * 24, 0);
+    const frames = [];
+    let root = "";
+    for (let bone = 0; bone < bones; ++bone) {
+        const dummy = data.getUint8(pos++);
+        if (dummy > 1) throw new Error("骨骼表无效。");
+        if (dummy) continue;
+        const parent = data.getInt16(pos + 32, true);
+        if (bone === 0 && parent === -1) {
+            root = new TextDecoder().decode(payload.subarray(pos, pos + 32)).split("\0")[0];
+            let track = pos + 34 + keys.slice(0, 82).reduce((sum, count) => sum + count * 24, 0);
+            for (let frame = 0; frame < keys[82]; ++frame, track += 12) {
+                const z = data.getFloat32(track + 8, true);
+                if (!Number.isFinite(z)) throw new Error("根骨骼高度无效。");
+                frames.push({ offset: track + 8, z });
+            }
+        }
+        pos += 34 + boneBytes;
+    }
+    if (pos !== payload.length || !frames.length) throw new Error("文件布局不受支持。");
+    return { buffer, payload, frames, root, bones, actions };
+}
+
+function exportPlayer(model, heights) {
+    if (heights.length !== model.frames.length || heights.some(z => !Number.isFinite(Math.fround(z)))) {
+        throw new Error("请为每一帧输入有效的高度。");
+    }
+    const payload = model.payload.slice();
+    const data = new DataView(payload.buffer);
+    model.frames.forEach((frame, i) => data.setFloat32(frame.offset, heights[i], true));
+    const output = new Uint8Array(model.buffer.slice(0));
+    output.set(crypt(payload, true), 8);
+    return output;
+}
+
+const byId = id => document.getElementById(id);
+let model;
+let inputs = [];
+byId("file").addEventListener("change", async event => {
+    byId("editor").hidden = true;
+    byId("status").textContent = "";
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+        model = readPlayer(await file.arrayBuffer());
+        const rows = byId("frames");
+        rows.replaceChildren();
+        inputs = model.frames.map((frame, i) => {
+            const row = rows.insertRow();
+            row.insertCell().textContent = i;
+            row.insertCell().textContent = frame.z.toFixed(4);
+            const input = document.createElement("input");
+            input.type = "number";
+            input.step = "any";
+            input.value = frame.z;
+            input.setAttribute("aria-label", "第 " + i + " 帧 Z");
+            row.insertCell().append(input);
+            return input;
+        });
+        byId("status").textContent = model.bones + " 根骨骼，" + model.actions + " 个动作。动作 82 共 " +
+            model.frames.length + " 帧，根骨骼 " + model.root + "。";
+        byId("editor").hidden = false;
+    } catch (error) {
+        byId("status").textContent = error.message;
+    }
+});
+byId("apply").addEventListener("click", () => {
+    const offset = byId("offset").valueAsNumber;
+    const heights = inputs.map(input => input.valueAsNumber + offset);
+    if (heights.every(z => Number.isFinite(Math.fround(z)))) {
+        inputs.forEach((input, i) => { input.value = heights[i]; });
+    }
+});
+byId("save").addEventListener("click", () => {
+    try {
+        const bytes = exportPlayer(model, inputs.map(input => input.valueAsNumber));
+        const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "player-action82.bmd";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+        byId("status").textContent = error.message;
+    }
+});
+</script>
